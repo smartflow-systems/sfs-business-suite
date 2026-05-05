@@ -1,12 +1,60 @@
 import express from "express";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
+import helmet from "helmet";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const app = express();
 
-// Middleware
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Security: helmet sets secure HTTP headers
+app.use(helmet());
+
+// CORS: restrict to known origins in production
+const allowedOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(",").map(o => o.trim())
+  : [];
+app.use(cors({
+  origin: process.env.NODE_ENV === "production"
+    ? (allowedOrigins.length ? allowedOrigins : false)
+    : "*",
+  credentials: true,
+}));
+
+// Rate limiting: global API limiter
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many requests, please try again later." },
+});
+
+// Stricter limiter for lead submission
+const leadsLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many lead submissions, please try again later." },
+});
+
+app.use("/api/", apiLimiter);
+app.use(express.json({ limit: "10kb" }));
+app.use(express.urlencoded({ extended: true, limit: "10kb" }));
+
+// Internal admin token check (set ADMIN_TOKEN env var)
+function requireAdminToken(req, res, next) {
+  const token = req.headers["x-admin-token"];
+  const adminToken = process.env.ADMIN_TOKEN;
+  if (!adminToken || token !== adminToken) {
+    return res.status(401).json({ success: false, message: "Unauthorized" });
+  }
+  next();
+}
 
 // Load config once at startup
 const config = JSON.parse(readFileSync("./public/site.config.json", "utf-8"));
@@ -31,7 +79,7 @@ function readLeads() {
     const data = readFileSync(leadsFile, "utf-8");
     return JSON.parse(data);
   } catch (error) {
-    console.error("Error reading leads:", error);
+    console.error("Error reading leads file");
     return { leads: [] };
   }
 }
@@ -42,7 +90,7 @@ function writeLeads(data) {
     writeFileSync(leadsFile, JSON.stringify(data, null, 2));
     return true;
   } catch (error) {
-    console.error("Error writing leads:", error);
+    console.error("Error writing leads file");
     return false;
   }
 }
@@ -50,20 +98,12 @@ function writeLeads(data) {
 // serve everything from /public
 app.use(express.static("public"));
 
-// health check with site info
-app.get("/health", (_req, res) => res.json({
-  ok: true,
-  siteName: config.siteName,
-  version: config.version
-}));
-app.get("/api/health", (_req, res) => res.json({
-  ok: true,
-  siteName: config.siteName,
-  version: config.version
-}));
+// health check
+app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
 // API: Submit Lead
-app.post("/api/leads", (req, res) => {
+app.post("/api/leads", leadsLimiter, (req, res) => {
   try {
     const { firstName, lastName, email, company, phone, source } = req.body;
 
@@ -73,6 +113,15 @@ app.post("/api/leads", (req, res) => {
         success: false,
         message: "First name, last name, and email are required"
       });
+    }
+
+    // Validate input lengths to prevent oversized payloads slipping through
+    if (
+      typeof firstName !== "string" || firstName.length > 100 ||
+      typeof lastName !== "string" || lastName.length > 100 ||
+      typeof email !== "string" || email.length > 254
+    ) {
+      return res.status(400).json({ success: false, message: "Invalid input" });
     }
 
     // Validate email format
@@ -111,17 +160,14 @@ app.post("/api/leads", (req, res) => {
       updatedAt: new Date().toISOString()
     };
 
-    // Add lead to array
     data.leads.push(newLead);
 
-    // Save to file
     if (!writeLeads(data)) {
       throw new Error("Failed to save lead");
     }
 
-    console.log(`✓ New lead captured: ${email}`);
+    console.log("New lead captured");
 
-    // Return success
     res.status(201).json({
       success: true,
       message: "Lead captured successfully",
@@ -129,7 +175,7 @@ app.post("/api/leads", (req, res) => {
     });
 
   } catch (error) {
-    console.error("Lead submission error:", error);
+    console.error("Lead submission error");
     res.status(500).json({
       success: false,
       message: "Internal server error"
@@ -137,8 +183,8 @@ app.post("/api/leads", (req, res) => {
   }
 });
 
-// API: Get All Leads (admin only - no auth for now, add later)
-app.get("/api/leads", (_req, res) => {
+// API: Get All Leads — requires admin token
+app.get("/api/leads", requireAdminToken, (_req, res) => {
   try {
     const data = readLeads();
     res.json({
@@ -147,7 +193,7 @@ app.get("/api/leads", (_req, res) => {
       leads: data.leads
     });
   } catch (error) {
-    console.error("Error fetching leads:", error);
+    console.error("Error fetching leads");
     res.status(500).json({
       success: false,
       message: "Failed to fetch leads"
@@ -155,12 +201,16 @@ app.get("/api/leads", (_req, res) => {
   }
 });
 
-// API: Stripe Checkout (placeholder - requires Stripe configuration)
-app.post("/api/stripe/checkout", async (req, res) => {
+// API: Stripe Checkout (placeholder)
+app.post("/api/stripe/checkout", (req, res) => {
   try {
-    const { planId, successUrl, cancelUrl } = req.body;
+    const { planId } = req.body;
 
-    // Load pricing data
+    // Validate planId is a simple alphanumeric string
+    if (!planId || typeof planId !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(planId)) {
+      return res.status(400).json({ success: false, message: "Invalid plan ID" });
+    }
+
     const pricingData = JSON.parse(readFileSync("./public/pricing.json", "utf-8"));
     const plan = pricingData.plans.find(p => p.id === planId);
 
@@ -171,28 +221,17 @@ app.post("/api/stripe/checkout", async (req, res) => {
       });
     }
 
-    // TODO: Implement Stripe checkout session
-    // For now, return a placeholder response
-    // You'll need to:
-    // 1. Install stripe package: npm install stripe
-    // 2. Add STRIPE_SECRET_KEY to .env
-    // 3. Create Stripe checkout session
-
-    console.log(`Checkout requested for plan: ${planId}`);
-
-    // Placeholder response
     res.json({
       success: true,
       message: "Stripe integration pending",
       planId,
       plan: plan.name,
       price: plan.price,
-      // In production, return: url: session.url
-      url: `/contact.html?plan=${planId}` // Temporary redirect to contact
+      url: `/contact.html?plan=${encodeURIComponent(planId)}`
     });
 
   } catch (error) {
-    console.error("Checkout error:", error);
+    console.error("Checkout error");
     res.status(500).json({
       success: false,
       message: "Failed to create checkout session"
@@ -200,7 +239,13 @@ app.post("/api/stripe/checkout", async (req, res) => {
   }
 });
 
-// port
+// Global error handler
+app.use((err, _req, res, _next) => {
+  console.error("Unhandled error:", err.message);
+  const status = err.status || err.statusCode || 500;
+  res.status(status).json({ success: false, message: "Internal server error" });
+});
+
 const port = process.env.PORT || 5000;
 app.listen(port, () => console.log(`serving on ${port}`));
 export default app;

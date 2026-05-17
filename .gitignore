@@ -227,3 +227,4 @@ lerna-debug.log*
 *.swo
 *~
 attached_assets/
+.env.bak.*
